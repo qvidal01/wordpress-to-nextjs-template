@@ -1,0 +1,81 @@
+name: Deploy to Proxmox
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Next.js site
+        run: npm run build
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PROXMOX_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.PROXMOX_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+          cat > ~/.ssh/config <<EOF
+          Host ${{ secrets.PROXMOX_HOST }}
+            StrictHostKeyChecking no
+            UserKnownHostsFile=/dev/null
+          EOF
+
+      - name: Deploy to Proxmox Container
+        run: |
+          # Use rsync to copy files, avoiding macOS extended attributes
+          ssh ${{ secrets.PROXMOX_USER }}@${{ secrets.PROXMOX_HOST }} << 'EOF'
+            # Backup current site
+            sudo pct exec 140 -- tar czf /tmp/backup-$(date +%Y%m%d-%H%M%S).tar.gz -C /var/www/aiqso.io . || true
+
+            # Create temporary directory on host
+            mkdir -p /tmp/nextjs-deploy
+          EOF
+
+          # Rsync build output to Proxmox host (excludes macOS metadata)
+          rsync -avz --delete --exclude='._*' --exclude='.DS_Store' \
+            out/ ${{ secrets.PROXMOX_USER }}@${{ secrets.PROXMOX_HOST }}:/tmp/nextjs-deploy/
+
+          # Copy into container and set permissions
+          ssh ${{ secrets.PROXMOX_USER }}@${{ secrets.PROXMOX_HOST }} << 'EOF'
+            # Clear old files
+            sudo pct exec 140 -- rm -rf /var/www/aiqso.io/*
+
+            # Copy new files into container
+            sudo cp -r /tmp/nextjs-deploy/* /var/lib/lxc/140/rootfs/var/www/aiqso.io/
+
+            # Remove any Next.js metadata directories that conflict with .html files
+            for dir in /var/lib/lxc/140/rootfs/var/www/aiqso.io/*/; do
+              if [ -f "${dir%/}.html" ]; then
+                sudo rm -rf "$dir"
+              fi
+            done
+
+            # Set proper permissions
+            sudo chown -R 33:33 /var/lib/lxc/140/rootfs/var/www/aiqso.io/
+
+            # Reload web server
+            sudo pct exec 140 -- systemctl reload apache2 || sudo pct exec 140 -- systemctl restart apache2
+
+            # Cleanup
+            rm -rf /tmp/nextjs-deploy
+          EOF
+
+      - name: Deployment complete
+        run: echo "✅ Successfully deployed to https://aiqso.io"
